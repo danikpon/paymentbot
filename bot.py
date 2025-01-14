@@ -14,8 +14,8 @@ from aiogram.dispatcher.router import Router
 # Фильтры для /start и других команд (Aiogram 3.x)
 from aiogram.filters import CommandStart, Command
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "ВАШ_ТОКЕН"   # <-- вставьте реальный токен
-PAYMENT_URL = "https://example.com/payment_link"    # <-- ваша ссылка на оплату
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "ВАШ_ТОКЕН"   # <-- Вставьте сюда реальный токен
+PAYMENT_URL = "https://example.com/payment_link"    # <-- Ваша ссылка на оплату
 COST_PER_MONTH = 50
 
 bot = Bot(token=BOT_TOKEN)
@@ -68,8 +68,20 @@ async def callback_pay_50(callback: CallbackQuery):
         "period": 1
     }
 
-    await callback.message.answer("Выбрано 50 рублей. Напоминание будет раз в месяц.")
-    await callback.answer()  # Убираем "часики" в интерфейсе Telegram
+    # Клавиатура с URL-кнопкой «Оплатить»
+    pay_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
+        ]
+    )
+
+    # Отправляем сообщение со ссылкой на оплату сразу
+    await callback.message.answer(
+        "Выбрано 50 рублей. Нажмите кнопку, чтобы оплатить.\n"
+        "Напоминание будет раз в месяц.",
+        reply_markup=pay_keyboard
+    )
+    await callback.answer()  # Убираем "часики"
 
     schedule_reminder(user_id)
 
@@ -127,9 +139,19 @@ async def handle_custom_amount_message(message: Message):
         "period": period
     }
 
+    # Клавиатура с URL-кнопкой «Оплатить»
+    pay_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
+        ]
+    )
+
+    # Сразу отправляем сообщение со ссылкой для оплаты
     await message.answer(
-        f"Вы оплатили {amount} рублей, чего хватит на {period} месяц(ев). "
-        f"Напоминания будут приходить раз в {period} месяц(ев)."
+        f"Вы ввели сумму: {amount} рублей. Этого хватит на {period} мес.\n"
+        f"Нажмите кнопку, чтобы оплатить.\n"
+        f"Напоминание будет раз в {period} месяц(ев).",
+        reply_markup=pay_keyboard
     )
     schedule_reminder(user_id)
 
@@ -147,14 +169,17 @@ def schedule_reminder(user_id: int):
     period = user_info["period"]
 
     async def send_reminder():
+        # При напоминании тоже отправляем кнопку
+        pay_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
+            ]
+        )
+
         await bot.send_message(
             user_id,
             f"Напоминание: пора оплатить {amount} рублей. Нажмите кнопку, чтобы оплатить.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
-                ]
-            )
+            reply_markup=pay_keyboard
         )
 
     # Примерно: 1 месяц = 4 недели
