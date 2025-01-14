@@ -9,40 +9,46 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
+    BotCommand
 )
 from aiogram.dispatcher.router import Router
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "ВАШ_ТОКЕН"    # <-- Вставьте сюда реальный токен
-PAYMENT_URL = "https://example.com/payment_link"     # <-- Ваша ссылка на оплату
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "ВАШ_ТОКЕН"  # <-- Вставьте сюда реальный токен
+PAYMENT_URL = "https://example.com/payment_link"   # <-- Ваша ссылка на оплату
 COST_PER_MONTH = 50
 
+# Планировщик с часовым поясом (например, Moscow). Замените при необходимости.
 scheduler = AsyncIOScheduler(timezone=pytz.timezone("Europe/Moscow"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# user_data[user_id] = {
-#   "waiting_for_amount": bool,       # Ждём ли мы обычную сумму?
-#   "waiting_for_people_count": bool, # Ждём ли мы число людей?
-#   "waiting_for_total_sum": bool,    # Ждём ли мы сумму для нескольких человек?
-#   "people_count": int,             # Сколько человек?
-#   "amount": int,                   # Общая сумма (для обычной логики) или рассчитанная сумма на 1 человека
-#   "period": int,
-#   "job_id": str|None
-# }
+"""
+user_data[user_id] = {
+  "waiting_for_amount": bool,        # Ждём ли «свою сумму»
+  "waiting_for_people_count": bool,  # Ждём ли «кол-во человек»
+  "waiting_for_total_sum": bool,     # Ждём ли «общую сумму» (split)
+  "people_count": int,               # Сколько человек
+  "amount": int,                     # Сумма (на 1 человека, если split)
+  "period": int,                     # кол-во минут для теста
+  "expire_date": datetime,           # время, когда заканчивается период
+  "job_id": str|None                 # id задачи в APScheduler
+}
+"""
+
 user_data = {}
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     """
-    Обработка команды /start. Предлагаем:
-    1) Оплатить 50
-    2) Своя сумма
-    3) Оплата на нескольких человек
+    Обработка команды /start. Предлагаем 3 варианта:
+      - Оплатить 50
+      - Своя сумма
+      - Оплата на нескольких человек
     """
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -56,9 +62,11 @@ async def cmd_start(message: Message):
         ]
     )
     await message.answer(
-        "Привет! Я помогу отслеживать оплату. Выберите подходящий вариант:",
+        "Привет! Я помогу отслеживать оплату.\n"
+        "Выберите подходящий вариант (или введите /check для проверки подписки):",
         reply_markup=keyboard
     )
+
     user_data[message.from_user.id] = {
         "waiting_for_amount": False,
         "waiting_for_people_count": False,
@@ -66,24 +74,56 @@ async def cmd_start(message: Message):
         "people_count": 0,
         "amount": 0,
         "period": 0,
+        "expire_date": None,
         "job_id": None
     }
+
+
+@router.message(Command("check"))
+async def cmd_check(message: Message):
+    """
+    Команда /check — проверяет, сколько минут осталось до окончания текущего периода.
+    """
+    user_id = message.from_user.id
+    data = user_data.get(user_id)
+    if not data:
+        await message.answer("Вы ещё не начали подписку. Введите /start.")
+        return
+
+    expire_date = data.get("expire_date")
+    if not expire_date:
+        await message.answer("У вас нет активной подписки.")
+        return
+
+    now = datetime.now()
+    if now >= expire_date:
+        await message.answer("Срок вашей подписки уже истёк.")
+        return
+
+    # Сколько осталось в минутах (для тестового примера)
+    delta = expire_date - now
+    minutes_left = int(delta.total_seconds() // 60)
+    await message.answer(f"До окончания подписки осталось ~ {minutes_left} мин(ут).")
 
 
 @router.callback_query(lambda c: c.data == "pay_50")
 async def callback_pay_50(callback: CallbackQuery):
     """
     Нажатие «Оплатить 50 рублей».
-    Создаём одноразовую задачу, которая через 1 минуту пришлёт напоминание.
+    Создаём одноразовую задачу через 1 минуту (50/50=1), указываем expire_date.
     """
     user_id = callback.from_user.id
+    period = 1  # минута
+
+    expire_date = datetime.now() + timedelta(minutes=period)
     user_data[user_id] = {
         "waiting_for_amount": False,
         "waiting_for_people_count": False,
         "waiting_for_total_sum": False,
         "people_count": 0,
         "amount": 50,
-        "period": 1,   # 1 минута (поскольку 50//50 = 1)
+        "period": period,
+        "expire_date": expire_date,
         "job_id": None
     }
 
@@ -92,9 +132,7 @@ async def callback_pay_50(callback: CallbackQuery):
         "Через 1 минуту я пришлю напоминание (для теста).",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)
-                ]
+                [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
             ]
         )
     )
@@ -115,8 +153,10 @@ async def callback_custom_amount(callback: CallbackQuery):
         "people_count": 0,
         "amount": 0,
         "period": 0,
+        "expire_date": None,
         "job_id": None
     }
+
     await callback.message.answer("Пожалуйста, введите сумму (например, 100, 500р, 1к).")
     await callback.answer()
 
@@ -124,19 +164,20 @@ async def callback_custom_amount(callback: CallbackQuery):
 @router.callback_query(lambda c: c.data == "split_payment")
 async def callback_split_payment(callback: CallbackQuery):
     """
-    Нажатие «Оплата на нескольких человек».
-    Сначала просим ввести, на скольких человек.
+    Нажатие «Оплата на нескольких человек». Сначала спрашиваем кол-во человек.
     """
     user_id = callback.from_user.id
     user_data[user_id] = {
         "waiting_for_amount": False,
-        "waiting_for_people_count": True,   # <-- ждём кол-во человек
+        "waiting_for_people_count": True,
         "waiting_for_total_sum": False,
         "people_count": 0,
         "amount": 0,
         "period": 0,
+        "expire_date": None,
         "job_id": None
     }
+
     await callback.message.answer("На скольких человек будет оплата? (Введите число)")
     await callback.answer()
 
@@ -144,57 +185,44 @@ async def callback_split_payment(callback: CallbackQuery):
 @router.message(F.text)
 async def handle_user_text(message: Message):
     """
-    Этот хендлер обрабатывает ВСЕ простые сообщения.
-    Проверяем, чего мы ждём: 
-    - waiting_for_amount (обычная сумма)
-    - waiting_for_people_count (сколько человек?)
-    - waiting_for_total_sum (какова общая сумма, чтобы поделить?)
+    Обрабатываем текст пользователя. Смотрим, что мы ждём:
+    - waiting_for_amount (своя сумма)
+    - waiting_for_people_count (кол-во человек)
+    - waiting_for_total_sum (общая сумма для split)
     """
     user_id = message.from_user.id
-    if user_id not in user_data:
-        return  # пользователь не проходил /start
+    data = user_data.get(user_id, {})
 
-    data = user_data[user_id]
-
-    # 1) Обычная логика "Своя сумма"
-    if data["waiting_for_amount"]:
+    if data.get("waiting_for_amount"):
         await process_custom_amount(message)
         return
 
-    # 2) Если ждём кол-во человек
-    if data["waiting_for_people_count"]:
-        # Пытаемся считать кол-во человек
-        text = message.text.strip()
-        if not text.isdigit():
+    if data.get("waiting_for_people_count"):
+        # Просили кол-во человек
+        if not message.text.isdigit():
             await message.answer("Пожалуйста, введите число (количество человек).")
             return
 
-        people = int(text)
+        people = int(message.text)
         if people < 1:
-            await message.answer("Количество человек должно быть больше 0.")
+            await message.answer("Количество человек должно быть > 0.")
             return
 
-        # Сохраняем
         data["waiting_for_people_count"] = False
         data["people_count"] = people
-        data["waiting_for_total_sum"] = True  # теперь ждём общую сумму
-        await message.answer(
-            f"Хорошо, {people} человек.\nТеперь введите общую сумму (например, 300, 1500р)."
-        )
+        data["waiting_for_total_sum"] = True
+        await message.answer(f"Хорошо, {people} человек.\nТеперь введите общую сумму (например, 300, 1500р).")
         return
 
-    # 3) Если ждём общую сумму для split_payment
-    if data["waiting_for_total_sum"]:
+    if data.get("waiting_for_total_sum"):
         await process_split_total_sum(message)
         return
-
-    # Если ничего не ждём — игнорируем (или ответим что-то)
-    # await message.answer("Я не жду никаких ответов в данный момент.")
 
 
 async def process_custom_amount(message: Message):
     """
-    Логика обработки «Своя сумма» (ожидаем одно число).
+    Логика «Своя сумма». Вычисляем период = amount // COST_PER_MONTH.
+    Если >=1, запоминаем expire_date и планируем.
     """
     user_id = message.from_user.id
     data = user_data[user_id]
@@ -212,22 +240,21 @@ async def process_custom_amount(message: Message):
     if period < 1:
         await message.answer(
             f"Сумма {amount} рублей недостаточна для оплаты хотя бы одного периода.\n"
-            f"Стоимость 'периода': {COST_PER_MONTH} руб."
+            f"Стоимость периода: {COST_PER_MONTH} руб."
         )
         return
 
-    # Сохраняем
-    data["waiting_for_amount"] = False
-    data["amount"] = amount
-    data["period"] = period
-    data["people_count"] = 0
-    data["waiting_for_people_count"] = False
-    data["waiting_for_total_sum"] = False
+    expire_date = datetime.now() + timedelta(minutes=period)
+    data.update({
+        "waiting_for_amount": False,
+        "amount": amount,
+        "period": period,
+        "expire_date": expire_date
+    })
 
-    # Ответ и планирование
     await message.answer(
-        f"Сумма {amount} руб. Это {period} минут(ы) 'подписки' (для теста).\n"
-        "Нажмите кнопку, чтобы оплатить. Через указанный срок я пришлю напоминание.",
+        f"Сумма {amount} руб. Это {period} минут(ы) 'подписки'.\n"
+        "Нажмите кнопку, чтобы оплатить. После этого через заданный срок придёт напоминание.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
@@ -239,8 +266,10 @@ async def process_custom_amount(message: Message):
 
 async def process_split_total_sum(message: Message):
     """
-    Логика обработки «общей суммы», если выбрали "Оплата на нескольких человек".
-    Мы делим введённую сумму на data["people_count"] и считаем период.
+    Логика «Оплата на нескольких человек»:
+    - user_data[user_id]["people_count"] = N
+    - Вводим общую сумму, делим на N => sum_per_person
+    - period = sum_per_person // COST_PER_MONTH
     """
     user_id = message.from_user.id
     data = user_data[user_id]
@@ -255,35 +284,30 @@ async def process_split_total_sum(message: Message):
 
     total_sum = int(input_text)
     people = data["people_count"]
-    if people < 1:
-        await message.answer("Количество человек должно быть >=1. Попробуйте заново.")
-        return
-
-    # Считаем сумму на 1 человека
-    sum_per_person = total_sum // people
+    sum_per_person = total_sum // people if people > 0 else 0
     period = sum_per_person // COST_PER_MONTH
 
     if period < 1:
         await message.answer(
             f"Сумма {total_sum} руб. на {people} человек = {sum_per_person} руб. на человека.\n"
-            f"Недостаточно для оплаты хотя бы одного периода (нужно >= {COST_PER_MONTH} руб. на человека).\n"
+            f"Недостаточно для оплаты хотя бы одного периода (>= {COST_PER_MONTH} руб. на человека).\n"
             "Попробуйте увеличить сумму."
         )
         return
 
-    # Сохраняем
-    data["waiting_for_total_sum"] = False
-    data["people_count"] = people
-    data["amount"] = sum_per_person
-    data["period"] = period
-    data["waiting_for_amount"] = False
-    data["waiting_for_people_count"] = False
+    expire_date = datetime.now() + timedelta(minutes=period)
+    data.update({
+        "waiting_for_total_sum": False,
+        "amount": sum_per_person,
+        "period": period,
+        "expire_date": expire_date
+    })
 
     await message.answer(
         f"Итого на одного человека: {sum_per_person} руб.\n"
-        f"Это {period} минут(ы) 'подписки' (для теста).\n"
+        f"Это {period} минут подписки.\n"
         "Нажмите кнопку, чтобы оплатить.\n"
-        "Через указанный срок я пришлю напоминание.",
+        "Через этот срок придёт напоминание.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
@@ -295,24 +319,25 @@ async def process_split_total_sum(message: Message):
 
 def schedule_one_time_reminder(user_id: int):
     """
-    Создаём одноразовое напоминание через period минут (для теста).
-    Когда наступит время, бот пришлёт сообщение с кнопками:
-    - «Оплатить 50 рублей»
-    - «Своя сумма»
-    - «Оплата на нескольких человек»
-    - «Прекратить подписку»
-    
-    Если пользователь не нажал ничего — подписка не продлевается.
+    Создаём ОДНОРАЗОВОЕ напоминание (trigger='date'):
+      run_date = now + period (в минутах)
+    Когда наступит время, отправляем сообщение с 4 кнопками:
+    - Оплатить 50
+    - Своя сумма
+    - Оплата на нескольких человек
+    - Прекратить подписку
     """
     data = user_data.get(user_id)
     if not data:
         return
 
     period = data["period"]
-    if period < 1:
+    expire_date = data["expire_date"]
+    if not expire_date or period < 1:
         return
 
-    run_date = datetime.now() + timedelta(minutes=period)
+    # Генерируем ID задачи (не обязательно)
+    run_date = expire_date
     job_id = f"reminder_{user_id}_{run_date.timestamp()}"
     data["job_id"] = job_id
 
@@ -334,9 +359,10 @@ def schedule_one_time_reminder(user_id: int):
         )
         await bot.send_message(
             user_id,
-            "Напоминание! Время продлить подписку. Выберите вариант:",
+            "Напоминание! Время продлить подписку. Выберите вариант или введите /check чтобы узнать детали:",
             reply_markup=keyboard
         )
+        # Если пользователь не нажал ничего — подписка не продлевается.
 
     scheduler.add_job(
         send_reminder,
@@ -355,18 +381,18 @@ def schedule_one_time_reminder(user_id: int):
 ])
 async def callback_after_reminder(call: CallbackQuery):
     """
-    Обработка кнопок после напоминания:
-      - pay_50_again        (Оплатить 50 руб заново)
-      - custom_amount_again (Своя сумма заново)
-      - split_payment_again (Оплата на нескольких человек)
-      - stop_subscription   (Прекратить подписку)
+    Обработка нажатия кнопок после напоминания:
+      - pay_50_again
+      - custom_amount_again
+      - split_payment_again
+      - stop_subscription
     """
     user_id = call.from_user.id
     action = call.data
 
     if action == "stop_subscription":
-        # Пользователь прекратил подписку
-        await call.message.answer("Вы прекратили подписку. Напоминаний больше не будет.")
+        # Прекратить подписку
+        await call.message.answer("Подписка прекращена. Напоминаний больше не будет.")
         user_data[user_id] = {
             "waiting_for_amount": False,
             "waiting_for_people_count": False,
@@ -374,24 +400,28 @@ async def callback_after_reminder(call: CallbackQuery):
             "people_count": 0,
             "amount": 0,
             "period": 0,
+            "expire_date": None,
             "job_id": None
         }
         await call.answer()
         return
 
     if action == "pay_50_again":
+        period = 1
+        expire_date = datetime.now() + timedelta(minutes=period)
         user_data[user_id] = {
             "waiting_for_amount": False,
             "waiting_for_people_count": False,
             "waiting_for_total_sum": False,
             "people_count": 0,
             "amount": 50,
-            "period": 1,
+            "period": period,
+            "expire_date": expire_date,
             "job_id": None
         }
         await call.message.answer(
             "Снова выбрано 50 рублей. Нажмите кнопку, чтобы оплатить.\n"
-            "Через 1 минуту я пришлю напоминание.",
+            "Через 1 минуту я пришлю новое напоминание.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -400,8 +430,8 @@ async def callback_after_reminder(call: CallbackQuery):
                 ]
             )
         )
-        await call.answer()
         schedule_one_time_reminder(user_id)
+        await call.answer()
 
     elif action == "custom_amount_again":
         user_data[user_id] = {
@@ -411,13 +441,13 @@ async def callback_after_reminder(call: CallbackQuery):
             "people_count": 0,
             "amount": 0,
             "period": 0,
+            "expire_date": None,
             "job_id": None
         }
         await call.message.answer("Введите новую сумму (например, 100, 500р, 1к).")
         await call.answer()
 
     elif action == "split_payment_again":
-        # Аналогична логика «Оплата на нескольких человек»
         user_data[user_id] = {
             "waiting_for_amount": False,
             "waiting_for_people_count": True,
@@ -425,6 +455,7 @@ async def callback_after_reminder(call: CallbackQuery):
             "people_count": 0,
             "amount": 0,
             "period": 0,
+            "expire_date": None,
             "job_id": None
         }
         await call.message.answer("На скольких человек будет оплата? (Введите число)")
@@ -432,6 +463,13 @@ async def callback_after_reminder(call: CallbackQuery):
 
 
 async def main():
+    # Настраиваем команды, чтобы в меню бота были /start и /check
+    commands = [
+        BotCommand(command="start", description="Начать работу"),
+        BotCommand(command="check", description="Проверить подписку")
+    ]
+    await bot.set_my_commands(commands)
+
     scheduler.start()
     await dp.start_polling(bot)
 
