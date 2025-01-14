@@ -1,129 +1,170 @@
-import sqlite3
-import re
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils import executor
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncio
+import os
 
-# Инициализация бота
-BOT_TOKEN = "ВАШ_ТОКЕН"
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+from aiogram.dispatcher.router import Router
+
+# Фильтры для /start и других команд (Aiogram 3.x)
+from aiogram.filters import CommandStart, Command
+
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "ВАШ_ТОКЕН"   # <-- вставьте реальный токен
+PAYMENT_URL = "https://example.com/payment_link"    # <-- ваша ссылка на оплату
+COST_PER_MONTH = 50
+
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
 scheduler = AsyncIOScheduler()
 
-# Константы
-COST_PER_MONTH = 50  # Стоимость одного месяца (в рублях)
+# "База" в памяти
+# user_data[user_id] = { "waiting_for_amount": bool, "amount": int, "period": int }
+user_data = {}
 
-# Настройка базы данных
-conn = sqlite3.connect("payments.db")
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    amount INTEGER,
-    period INTEGER,
-    next_reminder TEXT
-)
-""")
-conn.commit()
 
-# Обработчик команды /start
-@dp.message_handler(commands=["start"])
-async def start_command(message: types.Message):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("Оплатить 50 рублей", callback_data="pay_50"),
-        InlineKeyboardButton("Своя сумма", callback_data="custom_amount")
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    """
+    Обработка команды /start. Предлагаем оплату 50 руб или ввод своей суммы.
+    """
+    # Создаём Inline-клавиатуру как список списков кнопок
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Оплатить 50 рублей", callback_data="pay_50"),
+                InlineKeyboardButton(text="Своя сумма", callback_data="custom_amount")
+            ]
+        ]
     )
     await message.answer(
         "Привет! Я помогу отслеживать оплату. Выберите сумму для оплаты:",
         reply_markup=keyboard
     )
 
-# Обработчик кнопок оплаты
-@dp.callback_query_handler(lambda call: call.data.startswith("pay"))
-async def handle_payment(call: types.CallbackQuery):
-    if call.data == "pay_50":
-        amount = 50
-        await call.message.answer("Вот ссылка для оплаты: ВАША_ССЫЛКА")
-        await set_payment_period(call.from_user.id, amount)
-    elif call.data == "custom_amount":
-        await call.message.answer(
-            "Введите сумму для оплаты (например: 1000, 1 000, 1000р, 1к, 1000 рублей):"
-        )
+    user_data[message.from_user.id] = {
+        "waiting_for_amount": False,
+        "amount": 0,
+        "period": 0
+    }
 
-# Обработка пользовательского ввода суммы
-@dp.message_handler()
-async def handle_custom_amount(message: types.Message):
-    user_input = message.text
-    amount = parse_amount(user_input)
 
-    if amount is None:
-        await message.answer(
-            "Не удалось распознать сумму. Укажите число, например: 1000, 1 000, 1к, 1000 рублей."
-        )
+@router.callback_query(lambda c: c.data == "pay_50")
+async def callback_pay_50(callback: CallbackQuery):
+    """
+    Когда пользователь нажал «Оплатить 50 рублей».
+    """
+    user_id = callback.from_user.id
+    user_data[user_id] = {
+        "waiting_for_amount": False,
+        "amount": 50,
+        "period": 1
+    }
+
+    await callback.message.answer("Выбрано 50 рублей. Напоминание будет раз в месяц.")
+    await callback.answer()  # Убираем "часики" в интерфейсе Telegram
+
+    schedule_reminder(user_id)
+
+
+@router.callback_query(lambda c: c.data == "custom_amount")
+async def callback_custom_amount(callback: CallbackQuery):
+    """
+    Когда пользователь нажал «Своя сумма».
+    Просим ввести сумму сообщением.
+    """
+    user_id = callback.from_user.id
+    user_data[user_id] = {
+        "waiting_for_amount": True,
+        "amount": 0,
+        "period": 0
+    }
+
+    await callback.message.answer("Пожалуйста, введите сумму (например, 100, 500р, 1к).")
+    await callback.answer()
+
+
+@router.message(F.text)
+async def handle_custom_amount_message(message: Message):
+    """
+    Обрабатываем обычные сообщения. Если бот «ждёт сумму», пытаемся её распарсить.
+    """
+    user_id = message.from_user.id
+
+    # Проверяем, действительно ли мы ждали сумму
+    if user_id not in user_data or not user_data[user_id]["waiting_for_amount"]:
         return
 
-    # Рассчитываем количество месяцев
+    input_text = message.text.lower().replace(" ", "").replace("руб", "").replace("р", "")
+    # Преобразование вида "1к" → "1000"
+    if "к" in input_text:
+        input_text = input_text.replace("к", "000")
+
+    if not input_text.isdigit():
+        await message.answer("Пожалуйста, введите корректную сумму (например, 1000, 1к, 500руб).")
+        return
+
+    amount = int(input_text)
     period = amount // COST_PER_MONTH
+
     if period < 1:
         await message.answer(
-            f"Сумма {amount} рублей слишком мала для оплаты хотя бы одного месяца (минимум {COST_PER_MONTH} рублей)."
+            f"Сумма {amount} рублей недостаточна для оплаты хотя бы одного месяца.\n"
+            f"Стоимость месяца: {COST_PER_MONTH} руб."
         )
         return
 
+    user_data[user_id] = {
+        "waiting_for_amount": False,
+        "amount": amount,
+        "period": period
+    }
+
     await message.answer(
-        f"Вы оплатили {amount} рублей, чего хватит на {period} месяцев. Напоминание будет приходить раз в {period} месяцев."
+        f"Вы оплатили {amount} рублей, чего хватит на {period} месяц(ев). "
+        f"Напоминания будут приходить раз в {period} месяц(ев)."
     )
-    await set_payment_period(message.from_user.id, amount, period)
+    schedule_reminder(user_id)
 
-# Установка периода оплаты
-async def set_payment_period(user_id, amount, period):
-    # Сохраняем данные пользователя
-    cursor.execute("""
-        INSERT OR REPLACE INTO users (user_id, amount, period, next_reminder)
-        VALUES (?, ?, ?, datetime('now', ? || ' months'))
-    """, (user_id, amount, period, period))
-    conn.commit()
 
-    # Планируем напоминание
-    schedule_reminder(user_id, period)
+def schedule_reminder(user_id: int):
+    """
+    Планируем отправку напоминания через period «месяцев».
+    Условно month = 4 недели.
+    """
+    user_info = user_data.get(user_id)
+    if not user_info:
+        return
 
-# Планирование напоминания
-def schedule_reminder(user_id, period):
-    def send_reminder():
-        cursor.execute("SELECT amount FROM users WHERE user_id = ?", (user_id,))
-        amount = cursor.fetchone()[0]
-        bot.send_message(
+    amount = user_info["amount"]
+    period = user_info["period"]
+
+    async def send_reminder():
+        await bot.send_message(
             user_id,
             f"Напоминание: пора оплатить {amount} рублей. Нажмите кнопку, чтобы оплатить.",
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("Оплатить", url="ВАША_ССЫЛКА")
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Оплатить", url=PAYMENT_URL)]
+                ]
             )
         )
-        # Обновляем дату следующего напоминания
-        cursor.execute("UPDATE users SET next_reminder = datetime('now', ? || ' months') WHERE user_id = ?",
-                       (period, user_id))
-        conn.commit()
-    scheduler.add_job(send_reminder, "date", run_date=f"datetime('now', {period} || ' months')")
 
-# Функция для обработки суммы
-def parse_amount(input_text):
-    # Убираем пробелы и символы валют
-    text = input_text.lower().replace(" ", "").replace("руб", "").replace("р", "")
+    # Примерно: 1 месяц = 4 недели
+    scheduler.add_job(send_reminder, "interval", weeks=period * 4)
 
-    # Если пользователь использует "1к" или "2к", преобразуем в тысячи
-    if "к" in text:
-        text = text.replace("к", "000")
-# Проверяем, является ли текст числом
-    if text.isdigit():
-        return int(text)
 
-    return None
+async def main():
+    scheduler.start()
+    await dp.start_polling(bot)
 
-# Запуск планировщика
-scheduler.start()
 
-# Запуск бота
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
